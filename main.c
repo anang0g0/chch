@@ -31,6 +31,8 @@ static_assert(SALT_LEN==16,"Expected 128-bit salt");
 
 #define MSG_BLOCK_LEN_KB 1
 
+#define MAX_PASSPHRASE_LEN 1024
+
 typedef struct {
 	unsigned char key[KEY_LEN];
 	union {
@@ -70,6 +72,18 @@ int derive_key(
 	return 0;
 }
 
+/*
+TODO:  finish and use
+size_t ltrim(char * s, size_t const len) {
+	size_t n = 0;
+	while (n<len) {
+		if (!isspace(s[n])) break;
+		n++;
+	}
+	s = &s[n];
+}
+*/
+
 size_t rtrim(char * s, size_t const len) {
 	char c;
 	size_t retlen = len;
@@ -85,17 +99,34 @@ size_t rtrim(char * s, size_t const len) {
 	return retlen;
 }
 
-int get_passphrase(char * p_passphrase, size_t * p_len, size_t const max_len) {
-	// Order to try:  ./.passphrase (maybe others later)
+int read_passphrase_from_file(char * p_passphrase, size_t * p_len, size_t const max_len, const char* const p_filepath) {
 	int fd;
-       	fd = open("./.passphrase", O_RDONLY);
-	if (fd < 0) {
-		return -1;
-	}
+	fd = open(p_filepath, O_RDONLY);
+	if (fd < 0) return -1;
 	*p_len = read(fd, p_passphrase, max_len);
 	*p_len = rtrim(p_passphrase,*p_len);
 	close(fd);
 	return 0;
+}
+
+int get_passphrase(char * p_passphrase, size_t * p_len, size_t const max_len, const char* const pass_arg, size_t const pass_arg_len) {
+	if (pass_arg!=NULL && pass_arg_len>0) {
+		if (pass_arg[0]=='@') {
+			const char* const p_filepath = pass_arg+1;
+			int rc = read_passphrase_from_file(p_passphrase, p_len, max_len, p_filepath);
+			if (rc!=0) {
+				logerror("get_passphrase: failed to get passphrase from file '%s'\n",p_filepath);
+			}
+			return rc;
+		} else {
+			*p_len = (pass_arg_len > max_len) ? max_len : pass_arg_len;
+			strncpy(p_passphrase, pass_arg, *p_len);
+			return 0;
+		}
+	} else {
+		logerror("get_passphrase: pass_arg == NULL or zero len\n");
+		return -1;
+	}
 }
 
 // Returns (initial_nonce + msg_num)
@@ -421,11 +452,12 @@ int main_encrypt(int argc, char** argv, char* const passbuf, size_t const passbu
 
 static struct option long_options[] =
 {
-	{"verbose", no_argument,       NULL,  'v'},
-	{"encrypt", no_argument,       NULL,  'e'},
-	{"decrypt", no_argument,       NULL,  'd'},
-	{"help",    no_argument,       NULL,  'h'},
-	{"fake-rng",no_argument,       NULL,  0},
+	{"verbose",   no_argument,       NULL,  'v'},
+	{"encrypt",   no_argument,       NULL,  'e'},
+	{"decrypt",   no_argument,       NULL,  'd'},
+	{"passphrase",required_argument, NULL,  'p'},
+	{"help",      no_argument,       NULL,  'h'},
+	{"fake-rng",  no_argument,       NULL,  0},
 	{0, 0, 0, 0}
 };
 
@@ -436,27 +468,35 @@ void usage(const char* const progname) {
 	fprintf(stderr, "Use ChaCha20-Poly1305 to encrypt stdin to stdout. Passphrase is read from\n");
 	fprintf(stderr, "the file \".passphrase\" in current directory.\n");
 	fprintf(stderr, "\n");
-	fprintf(stderr, "  -e, --encrypt     Encrypt (default)\n");
-	fprintf(stderr, "  -d, --decrypt     Decrypt\n");
-	fprintf(stderr, "  -v, --verbose     Verbose output (may use twice)\n");
-	fprintf(stderr, "  -h, --help        Print this message\n");
-	fprintf(stderr, "  --fake-rng        Override system RNG with one that always generates\n" \
-		        "                    byte strings 0a0a0a...  For testing only!\n");
+	fprintf(stderr, "  -e, --encrypt         Encrypt (default)\n");
+	fprintf(stderr, "  -d, --decrypt         Decrypt\n");
+	fprintf(stderr, "  -p, --pass [passphrase|@/path/to/file]\n");
+	fprintf(stderr, "                        Passphrase, either supplied directly or as a file\n");
+	fprintf(stderr, "                        path (by prefixing with '@')\n");
+	fprintf(stderr, "  -v, --verbose         Verbose output (may use twice)\n");
+	fprintf(stderr, "  -h, --help            Print this message\n");
+	fprintf(stderr, "  --fake-rng            Override system RNG with one that always generates\n" \
+		        "                        byte strings 0a0a0a...  For testing only!\n");
 	fprintf(stderr, "\n");
 	fprintf(stderr, "Encrypt a file under passphrase \"12345\":\n");
-	fprintf(stderr, "  echo \"12345\" > .passphrase ; %s -e < plaintext > ciphertext\n", progname);
+	fprintf(stderr, "  %s -e -p 12345 < plaintext > ciphertext\n", progname);
 	fprintf(stderr, "Decrypt back to original:\n");
-	fprintf(stderr, "  %s -d ciphertext.bin\n",progname);
+	fprintf(stderr, "  %s -d -p 12345 ciphertext.bin\n",progname);
+	fprintf(stderr, "\n");
 }
 
 int main(int argc, char** argv) {
 	int mode = 'e';
 	bool b_use_deterministic_rng = false;
 
+	// TODO:  use guarded heap alloc and zero memory after use
+	char passbuf[MAX_PASSPHRASE_LEN+1] = {'\0'};
+	size_t passbuf_len = 0;
+
 	// CLI options
 	while (1) {
 		int option_index = 0;
-		int c = getopt_long (argc, argv, "edvh", long_options, &option_index);
+		int c = getopt_long(argc, argv, "edvhp:", long_options, &option_index);
 		if (c==-1) break;
 		switch (c) {
 			case 0:
@@ -489,6 +529,21 @@ int main(int argc, char** argv) {
 				loginfo("option 'd'\n");
 				mode = 'd';
 				break;
+			case 'p':
+				loginfo("option 'p' with argument '%s'\n",optarg); // TODO:  passphrase leakage to stderr
+				if (optarg==NULL || strlen(optarg)==0) {
+					fprintf(stderr, "Passphrase argument required\n");
+					return -1;
+				}
+				size_t pass_arg_len = strlen(optarg);
+				int rc = get_passphrase(passbuf,&passbuf_len,sizeof(passbuf),optarg,pass_arg_len);
+				if (rc!=0) {
+					logerror("get_passphrase() failed (ret %d)\n",rc);
+					return rc;
+				} 
+				logtrace("passphrase '%s'\n",passbuf); // TODO:  passphrase leakage to stderr
+				memset(optarg, '*', pass_arg_len); // blanks out argument in `ps`
+				break;
 			case 'h':
 				loginfo("option 'h'\n");
 				usage(argv[0]);
@@ -500,6 +555,12 @@ int main(int argc, char** argv) {
 				exit(1);
 				break;
 		}
+	}
+
+	// Fail if no passphrase supplied
+	if (passbuf_len==0) {
+		logerror("abort because no passphrase\n");
+		return -1;
 	}
 
 	// Set fake RNG before sodium_init
@@ -519,17 +580,6 @@ int main(int argc, char** argv) {
 		} else {
 			logwarn("using deterministic random number generator (for testing only)\n");
 		}
-	}
-
-	// Read in passphrase
-	char passbuf[255] = {'\0'}; //TODO:  use guarded heap alloc
-	size_t passbuf_len = 0;
-	int rc = get_passphrase(passbuf,&passbuf_len,sizeof(passbuf));
-	if (rc!=0) {
-		logerror("get_passphrase() failed\n");
-		return -1;
-	} else {
-		loginfo("passphrase '%s'\n",passbuf);
 	}
 
 	if ( sodium_init() == -1 ) {
