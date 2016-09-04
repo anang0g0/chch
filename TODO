@@ -1,0 +1,9 @@
+1.  unit tests
+2.  functional tests
+3.  guarded heap allocs with atexit() for freeing
+4.  derivation of master key => N subkeys => use each one for a limited amount of data
+5.  CLI flags
+	- argon2 parameters
+	- enc vs dec
+	- aes256-gcm vs chacha20-poly1305
+
